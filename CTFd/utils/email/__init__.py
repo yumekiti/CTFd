@@ -2,9 +2,15 @@ from flask import url_for
 
 from CTFd.utils import get_config
 from CTFd.utils.config import get_mail_provider
-from CTFd.utils.email import mailgun, smtp
+from CTFd.utils.email.providers.mailgun import MailgunEmailProvider
+from CTFd.utils.email.providers.smtp import SMTPEmailProvider
 from CTFd.utils.formatters import safe_format
-from CTFd.utils.security.signing import serialize
+from CTFd.utils.security.email import (
+    generate_email_confirm_token,
+    generate_password_reset_token,
+)
+
+PROVIDERS = {"smtp": SMTPEmailProvider, "mailgun": MailgunEmailProvider}
 
 DEFAULT_VERIFICATION_EMAIL_SUBJECT = "Confirm your account for {ctf_name}"
 DEFAULT_VERIFICATION_EMAIL_BODY = (
@@ -42,11 +48,10 @@ DEFAULT_PASSWORD_CHANGE_ALERT_BODY = (
 def sendmail(addr, text, subject="Message from {ctf_name}"):
     subject = safe_format(subject, ctf_name=get_config("ctf_name"))
     provider = get_mail_provider()
-    if provider == "smtp":
-        return smtp.sendmail(addr, text, subject)
-    if provider == "mailgun":
-        return mailgun.sendmail(addr, text, subject)
-    return False, "No mail settings configured"
+    EmailProvider = PROVIDERS.get(provider)
+    if EmailProvider is None:
+        return False, "No mail settings configured"
+    return EmailProvider.sendmail(addr, text, subject)
 
 
 def password_change_alert(email):
@@ -70,7 +75,11 @@ def forgot_password(email):
         get_config("password_reset_body") or DEFAULT_PASSWORD_RESET_BODY,
         ctf_name=get_config("ctf_name"),
         ctf_description=get_config("ctf_description"),
-        url=url_for("auth.reset_password", data=serialize(email), _external=True),
+        url=url_for(
+            "auth.reset_password",
+            data=generate_password_reset_token(email),
+            _external=True,
+        ),
     )
 
     subject = safe_format(
@@ -86,7 +95,10 @@ def verify_email_address(addr):
         ctf_name=get_config("ctf_name"),
         ctf_description=get_config("ctf_description"),
         url=url_for(
-            "auth.confirm", data=serialize(addr), _external=True, _method="GET"
+            "auth.confirm",
+            data=generate_email_confirm_token(addr),
+            _external=True,
+            _method="GET",
         ),
     )
 
@@ -135,8 +147,26 @@ def user_created_notification(addr, name, password):
 def check_email_is_whitelisted(email_address):
     local_id, _, domain = email_address.partition("@")
     domain_whitelist = get_config("domain_whitelist")
+
     if domain_whitelist:
         domain_whitelist = [d.strip() for d in domain_whitelist.split(",")]
-        if domain not in domain_whitelist:
-            return False
+
+        for allowed_domain in domain_whitelist:
+            if allowed_domain.startswith("*."):
+                # domains should never container the "*" char
+                if "*" in domain:
+                    return False
+
+                # Handle wildcard domain case
+                suffix = allowed_domain[1:]  # Remove the "*" prefix
+                if domain.endswith(suffix):
+                    return True
+
+            elif domain == allowed_domain:
+                return True
+
+        # whitelist is specified but the email doesn't match any domains
+        return False
+
+    # whitelist is not specified - allow all emails
     return True
